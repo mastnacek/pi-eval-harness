@@ -2,13 +2,17 @@
  * pi-eval-harness — evaluation, motivation, and grading harness for the Pi
  * coding agent.
  *
- * Composition root ONLY: creates the EvalHarnessState kernel and wires slices
- * onto Pi events. No business logic lives here:
- * - rubric + gate + ledger        → src/slices/evalgate
- * - monitor summary (prompt block) → src/slices/summary
- * - event translation, rating dlg → src/slices/pipeline
- * - /eval command, eval_gate tool → src/slices/commands
- * - session state + config        → src/shared
+ * Layout (VSA — Vertical Slice Architecture):
+ * - index.ts                      composition root — Pi adapter only, no domain logic
+ * - src/shared/                   kernel: state.ts, config.ts (no slice imports)
+ * - src/slices/evalgate/          rubric, deterministic gate, global ledger
+ * - src/slices/summary/           compact "You Are Monitored" prompt block
+ * - src/slices/pipeline/          event translation + human rating dialog
+ * - src/slices/commands/          /eval command + eval_gate tool
+ * - src/slices/settings/          catalogue + lazy menu completions for /eval
+ *
+ * Rule: slices never import each other. They depend on src/shared only;
+ * index.ts wires them. NodeNext: src/** imports use explicit .js extensions.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";

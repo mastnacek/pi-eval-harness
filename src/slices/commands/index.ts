@@ -1,16 +1,17 @@
 /**
  * /eval command + eval_gate tool — user- and agent-facing entry points into
- * the evalgate slice. Completions follow the Trailing Space Contract
- * (rating is non-terminal).
+ * the evalgate and settings slices. Completions are delegated to the settings
+ * slice (lazy menus with live-value markers).
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { EvalHarnessState } from "../../shared/state.js";
 import { loadRubric, rubricToPrompt, runGate } from "../evalgate/index.js";
-import { appendRecord, readRecords } from "../evalgate/ledger.js";
+import { appendRecord, readRecords, type ScoreRecord } from "../evalgate/ledger.js";
 import { saveConfig } from "../../shared/config.js";
-import type { GateVerdict, ScoreRecord } from "../evalgate/index.js";
+import { findSetting, formatValue, parseValue, completeEvalArguments } from "../settings/index.js";
+import type { GateVerdict } from "../evalgate/gate.js";
 
 export function registerEvalGateTool(pi: ExtensionAPI, state: EvalHarnessState): void {
 	pi.registerTool({
@@ -33,16 +34,7 @@ export function registerEvalGateTool(pi: ExtensionAPI, state: EvalHarnessState):
 				skipCommands: params.dry_run === true,
 				signals: state.signalCounts,
 			});
-			appendRecord({
-				at: new Date().toISOString(),
-				project: ctx.cwd ?? process.cwd(),
-				rubric: rubric.name,
-				verdict: verdict.verdict,
-				score: verdict.score,
-				maxScore: verdict.maxScore,
-				failed: verdict.results.filter((r) => !r.ok).map((r) => r.id),
-				instantFailures: verdict.failures.map((f) => f.id),
-			});
+			persistVerdict(ctx.cwd ?? process.cwd(), rubric.name, verdict);
 			return {
 				content: [{ type: "text", text: formatVerdict(verdict) }],
 				details: { verdict: verdict.verdict, score: verdict.score },
@@ -53,22 +45,8 @@ export function registerEvalGateTool(pi: ExtensionAPI, state: EvalHarnessState):
 
 export function registerEvalCommand(pi: ExtensionAPI, state: EvalHarnessState): void {
 	pi.registerCommand("eval", {
-		description: "Evaluation harness (/eval [run|card|rubric|rating <on|off>])",
-		getArgumentCompletions: (prefix) => {
-			const subcmds = [
-				{ label: "run", value: "run" },
-				{ label: "card", value: "card" },
-				{ label: "rubric", value: "rubric" },
-				{ label: "rating", value: "rating " },
-			];
-			if (prefix.startsWith("rating ")) {
-				return [
-					{ label: "on", value: "rating on" },
-					{ label: "off", value: "rating off" },
-				];
-			}
-			return subcmds.filter((s) => s.label.startsWith(prefix));
-		},
+		description: "Evaluation harness (/eval [run|card|rubric|config <get|set>|rating <on|off>])",
+		getArgumentCompletions: (prefix) => completeEvalArguments(prefix, state.config),
 		handler: async (args, ctx) => {
 			const sub = args.trim() || "run";
 			const rubric = loadRubric(ctx.cwd ?? process.cwd());
@@ -83,18 +61,18 @@ export function registerEvalCommand(pi: ExtensionAPI, state: EvalHarnessState): 
 				return;
 			}
 
+			if (sub.startsWith("config")) {
+				await handleConfig(state, sub, ctx);
+				return;
+			}
+
 			if (sub.startsWith("rating")) {
 				const mode = sub.slice(6).trim();
 				if (mode === "on" || mode === "off") {
 					state.config.humanRating = mode === "on";
 					saveConfig(state.config);
 				}
-				if (ctx.hasUI) {
-					ctx.ui.notify(
-						`Human rating: ${state.config.humanRating ? "ON" : "OFF"} | Auto-gate: ${state.config.autoGate ? "ON" : "OFF"} | Only-when-BLOCKED: ${state.config.ratingOnlyWhenBlocked ? "ON" : "OFF"} | Timeout: ${state.config.ratingTimeoutMs}ms\nUsage: /eval rating [on|off]`,
-						"info",
-					);
-				}
+				if (ctx.hasUI) ctx.ui.notify(`Human rating: ${state.config.humanRating ? "ON" : "OFF"}`, "info");
 				return;
 			}
 
@@ -103,18 +81,70 @@ export function registerEvalCommand(pi: ExtensionAPI, state: EvalHarnessState): 
 				sessionText: state.sessionEvidence,
 				signals: state.signalCounts,
 			});
-			appendRecord({
-				at: new Date().toISOString(),
-				project: ctx.cwd ?? process.cwd(),
-				rubric: rubric.name,
-				verdict: verdict.verdict,
-				score: verdict.score,
-				maxScore: verdict.maxScore,
-				failed: verdict.results.filter((r) => !r.ok).map((r) => r.id),
-				instantFailures: verdict.failures.map((f) => f.id),
-			});
+			persistVerdict(ctx.cwd ?? process.cwd(), rubric.name, verdict);
 			if (ctx.hasUI) ctx.ui.notify(formatVerdict(verdict), verdict.verdict === "ACCEPTED" ? "info" : "warning");
 		},
+	});
+}
+
+/** /eval config get|set — driven by the settings catalogue (single source of truth). */
+async function handleConfig(
+	state: EvalHarnessState,
+	sub: string,
+	ctx: ExtensionCommandContext,
+): Promise<void> {
+	const parts = sub.split(/\s+/).filter(Boolean);
+	const action = parts[1]?.toLowerCase();
+
+	if (!action || action === "status" || !["get", "set"].includes(action)) {
+		if (ctx.hasUI) ctx.ui.notify("Usage: /eval config get <key> | /eval config set <key> <value>", "info");
+		return;
+	}
+
+	const key = parts[2];
+	if (!key) {
+		if (ctx.hasUI) ctx.ui.notify("Missing setting key. Try /eval config get <key>.", "warning");
+		return;
+	}
+
+	const spec = findSetting(key);
+	if (!spec) {
+		if (ctx.hasUI) ctx.ui.notify(`Unknown setting '${key}'.`, "warning");
+		return;
+	}
+
+	if (action === "get") {
+		if (ctx.hasUI) ctx.ui.notify(`${key} = ${formatValue(state.config[spec.key])} (${spec.description})`, "info");
+		return;
+	}
+
+	const raw = parts.slice(3).join(" ");
+	if (!raw) {
+		if (ctx.hasUI) ctx.ui.notify(`Missing value. /eval config set ${key} <value>`, "warning");
+		return;
+	}
+
+	const parsed = parseValue(spec, raw);
+	if (!parsed.ok) {
+		if (ctx.hasUI) ctx.ui.notify(parsed.error ?? "Invalid value.", "error");
+		return;
+	}
+
+	Object.assign(state.config, { [spec.key]: parsed.value });
+	saveConfig(state.config);
+	if (ctx.hasUI) ctx.ui.notify(`Saved: ${key} = ${formatValue(parsed.value)}`, "info");
+}
+
+function persistVerdict(cwd: string, rubricName: string, verdict: GateVerdict): void {
+	appendRecord({
+		at: new Date().toISOString(),
+		project: cwd,
+		rubric: rubricName,
+		verdict: verdict.verdict,
+		score: verdict.score,
+		maxScore: verdict.maxScore,
+		failed: verdict.results.filter((r) => !r.ok).map((r) => r.id),
+		instantFailures: verdict.failures.map((f) => f.id),
 	});
 }
 
