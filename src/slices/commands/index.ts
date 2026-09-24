@@ -97,11 +97,17 @@ async function handleConfig(
 	const action = parts[1]?.toLowerCase();
 
 	if (!action || action === "status" || !["get", "set"].includes(action)) {
-		if (ctx.hasUI) ctx.ui.notify("Usage: /eval config get <key> | /eval config set <key> <value>", "info");
+		if (ctx.hasUI) ctx.ui.notify("Usage: /eval config get <key> | /eval config set [--global] <key> <value>", "info");
 		return;
 	}
 
-	const key = parts[2];
+	// Handle --global flag (positional, before key)
+	let keyIndex = 2;
+	if (parts[2] === "--global") {
+		keyIndex = 3;
+	}
+
+	const key = parts[keyIndex];
 	if (!key) {
 		if (ctx.hasUI) ctx.ui.notify("Missing setting key. Try /eval config get <key>.", "warning");
 		return;
@@ -118,9 +124,10 @@ async function handleConfig(
 		return;
 	}
 
-	const raw = parts.slice(3).join(" ");
+	// For set, value starts after key (and optional --global)
+	const raw = parts.slice(keyIndex + 1).join(" ");
 	if (!raw) {
-		if (ctx.hasUI) ctx.ui.notify(`Missing value. /eval config set ${key} <value>`, "warning");
+		if (ctx.hasUI) ctx.ui.notify(`Missing value. /eval config set [--global] ${key} <value>`, "warning");
 		return;
 	}
 

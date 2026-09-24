@@ -28,6 +28,10 @@ const CONFIG_ACTIONS: readonly Suggestion[] = [
 	{ value: "set", description: "Save a new value for a setting", space: true },
 ];
 
+const GLOBAL_FLAG: readonly Suggestion[] = [
+	{ value: "--global", description: "Use global config (~/.pi/agent/pi-eval-harness.json)", space: true },
+];
+
 const TOGGLE_VALUES: readonly Suggestion[] = [
 	{ value: "on", description: "Zapnout" },
 	{ value: "off", description: "Vypnout" },
@@ -92,8 +96,10 @@ function completeValues(
  *   /eval                      → SUBCOMMANDS
  *   /eval config               → get|set            (lazy: token fully typed)
  *   /eval config get           → keys + live values
- *   /eval config set <key>     → keys + live values
+ *   /eval config set           → --global | keys + live values
+ *   /eval config set --global  → keys + live values
  *   /eval config set <key>     → true|false with ✓ marker
+ *   /eval config set --global <key> → true|false with ✓ marker
  *   /eval rating               → on|off             (lazy)
  */
 export function completeEvalArguments(
@@ -141,11 +147,42 @@ export function completeEvalArguments(
 		}
 
 		if (action === "set") {
+			// Handle --global flag before key
 			if (!afterAction.includes(" ")) {
-				return completeKeys("config set ", config, afterAction);
+				// Could be --global or a key
+				const items = [
+					...GLOBAL_FLAG.map((s) => ({
+						value: `config set ${s.value} `,
+						label: s.value,
+						description: s.description,
+					})),
+					...SETTING_SPECS.filter((spec) => spec.key.startsWith(afterAction)).map((spec) => ({
+						value: `config set ${spec.key} `,
+						label: spec.key,
+						description: `${spec.description} (nyní: ${formatValue(config[spec.key])})`,
+					})),
+				];
+				return items.length > 0 ? items : null;
 			}
-			const [key] = afterAction.split(/\s+/);
-			if (!key) return null;
+			const [first] = afterAction.split(/\s+/);
+			if (!first) return null;
+
+			// If first is --global, show keys next
+			if (first === "--global") {
+				const afterGlobal = afterAction.slice(first.length).trimStart();
+				if (!afterGlobal.includes(" ")) {
+					return completeKeys("config set --global ", config, afterGlobal);
+				}
+				const [key] = afterGlobal.split(/\s+/);
+				if (!key) return null;
+				const spec = findSetting(key);
+				if (!spec) return null;
+				const afterKey = afterGlobal.slice(key.length).trimStart();
+				return completeValues(`config set --global ${key} `, spec, config, afterKey);
+			}
+
+			// Otherwise first is a key
+			const key = first;
 			const spec = findSetting(key);
 			if (!spec) return null;
 			const afterKey = afterAction.slice(key.length).trimStart();
