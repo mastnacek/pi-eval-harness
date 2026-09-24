@@ -6,8 +6,8 @@
  * often penalized/praised for. English only, hard-capped length.
  */
 
-import { readRecords, type ScoreRecord } from "./ledger.js";
-import type { GateVerdict } from "./gate.js";
+import { readRecords, type ScoreRecord } from "../evalgate/ledger.js";
+import type { GateVerdict } from "../evalgate/gate.js";
 
 export type { ScoreRecord };
 
