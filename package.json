@@ -1,24 +1,39 @@
 {
   "name": "pi-eval-harness",
   "version": "0.1.0",
-  "description": "Evaluation, motivation, and self-compacting context harness for Pi coding agent",
+  "description": "Evaluation, motivation, and grading harness for Pi coding agent: rubrics, definition-of-done gates, and session report cards",
   "type": "module",
   "main": "index.ts",
   "keywords": [
     "pi",
+    "pi-package",
     "pi-extension",
     "evaluation",
     "rubric",
-    "self-compact",
-    "context-management"
+    "grading",
+    "definition-of-done"
   ],
   "author": "mastnacek",
   "license": "MIT",
+  "files": [
+    "README.md",
+    "package.json",
+    "index.ts",
+    "rubric.ts",
+    "gate.ts",
+    "report-card.ts"
+  ],
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
+  },
+  "scripts": {
+    "test": "node --test test/**/*.test.js"
   }
 }
