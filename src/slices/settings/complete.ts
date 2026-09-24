@@ -1,9 +1,9 @@
 /**
- * Lazy settings completions for /eval — follows the Lazy Parameter Completion
- * rule (a fully-typed non-terminal token ALREADY returns its children, because
- * the engine will not re-open the picker after a trailing-space Tab) and the
- * Current-Value State Annotation rule (✓ in label, " · ● AKTIVNÍ" in
- * description, never in value).
+ * Lazy settings completions for /eval — follows:
+ *   - Trailing Space Contract (non-terminal rows end with space, terminal rows do not)
+ *   - Current-Value State Annotation (✓ in label, " · ● AKTIVNÍ" in description, never in value)
+ *   - Full Prefix Replacement rule (item.value replaces entire argument string)
+ *   - Full `--global` prefix support (/eval --global <setting> <value>)
  */
 
 import type { EvalHarnessConfig } from "../../shared/config.js";
@@ -15,16 +15,26 @@ interface Suggestion {
 	space?: boolean;
 }
 
-const SUBCOMMANDS: readonly Suggestion[] = [
+const BASE_SUBCOMMANDS: readonly Suggestion[] = [
 	{ value: "run", description: "Run the deterministic grading gate now" },
 	{ value: "card", description: "Show the last 10 gate records from the global ledger" },
 	{ value: "rubric", description: "Show the active rubric as the agent sees it" },
-	{ value: "config", description: "Get or set a setting (lazy key/value menu)", space: true },
-	{ value: "rating", description: "Toggle human quick-rating on agent settle: on | off", space: true },
+	{ value: "status", description: "Show current configuration and gate status" },
+	{ value: "rating", description: "Toggle human quick-rating on agent settle (on | off)", space: true },
+	{ value: "autoGate", description: "Run shell commands in gate (true | false)", space: true },
+	{ value: "ratingOnlyWhenBlocked", description: "Show rating dialog only when BLOCKED (true | false)", space: true },
+	{ value: "ratingTimeoutMs", description: "Rating dialog timeout in ms", space: true },
+	{ value: "humanRating", description: "Human quick-rating on agent settle (true | false)", space: true },
+	{ value: "config", description: "Legacy get/set config menu", space: true },
+];
+
+const TOP_LEVEL_SUBCOMMANDS: readonly Suggestion[] = [
+	{ value: "--global", description: "Save following setting globally (~/.pi/agent/)", space: true },
+	...BASE_SUBCOMMANDS,
 ];
 
 const CONFIG_ACTIONS: readonly Suggestion[] = [
-	{ value: "get", description: "Print the current value of a setting", space: true },
+	{ value: "get", description: "Print current value of a setting", space: true },
 	{ value: "set", description: "Save a new value for a setting", space: true },
 ];
 
@@ -52,7 +62,7 @@ function filter(
 	return items.length > 0 ? items : null;
 }
 
-/** Key menu with live values: "(nyní: <value>)" — works for booleans and numbers. */
+/** Key menu with live values: "(nyní: <value>)" */
 function completeKeys(
 	base: string,
 	config: EvalHarnessConfig,
@@ -73,34 +83,40 @@ function completeValues(
 	config: EvalHarnessConfig,
 	prefix: string,
 ): Array<{ value: string; label: string; description: string }> | null {
-	if (spec.kind !== "boolean") return null;
-	const current = config[spec.key] as boolean;
-	const rows: Array<{ value: string; label: string; description: string }> = [
-		{
-			value: `${base}true`,
-			label: current ? "true ✓" : "true",
-			description: `${spec.valueHelp?.true ?? "Povolit"}${current ? " · ● AKTIVNÍ" : ""}`,
-		},
-		{
-			value: `${base}false`,
-			label: current ? "false" : "false ✓",
-			description: `${spec.valueHelp?.false ?? "Zakázat"}${current ? "" : " · ● AKTIVNÍ"}`,
-		},
-	];
-	return rows.filter((r) => r.value.endsWith(prefix) || r.label.startsWith(prefix));
+	if (spec.kind === "boolean") {
+		const current = Boolean(config[spec.key]);
+		const rows: Array<{ value: string; label: string; description: string }> = [
+			{
+				value: `${base}true`,
+				label: current ? "true ✓" : "true",
+				description: `${spec.valueHelp?.true ?? "Povolit"}${current ? " · ● AKTIVNÍ" : ""}`,
+			},
+			{
+				value: `${base}false`,
+				label: current ? "false" : "false ✓",
+				description: `${spec.valueHelp?.false ?? "Zakázat"}${current ? "" : " · ● AKTIVNÍ"}`,
+			},
+		];
+		const filtered = rows.filter((r) => r.value.endsWith(prefix) || r.label.startsWith(prefix));
+		return filtered.length > 0 ? filtered : rows;
+	}
+
+	if (spec.kind === "number") {
+		const current = config[spec.key];
+		const defaults = ["5000", "10000", "15000", "30000"].map((n) => ({
+			value: `${base}${n}`,
+			label: n === String(current) ? `${n} ✓` : n,
+			description: `${n} ms${n === String(current) ? " · ● AKTIVNÍ" : ""}`,
+		}));
+		const filtered = defaults.filter((r) => r.value.endsWith(prefix) || r.label.startsWith(prefix));
+		return filtered.length > 0 ? filtered : defaults;
+	}
+
+	return null;
 }
 
 /**
- * Entry point. prefix = the entire argument string after "/eval ".
- * Level structure:
- *   /eval                      → SUBCOMMANDS
- *   /eval config               → get|set            (lazy: token fully typed)
- *   /eval config get           → keys + live values
- *   /eval config set           → --global | keys + live values
- *   /eval config set --global  → keys + live values
- *   /eval config set <key>     → true|false with ✓ marker
- *   /eval config set --global <key> → true|false with ✓ marker
- *   /eval rating               → on|off             (lazy)
+ * Entry point. prefix = entire argument string after "/eval ".
  */
 export function completeEvalArguments(
 	prefix: string,
@@ -108,8 +124,35 @@ export function completeEvalArguments(
 ): Array<{ value: string; label: string; description: string }> | null {
 	const trimmed = prefix.trimStart();
 
+	// 1. Check if prefix starts with "--global"
+	if (trimmed.startsWith("--global")) {
+		const afterGlobal = trimmed.slice(8).trimStart();
+		const hasTrailingSpace = trimmed.length > 8 || /\s$/.test(prefix);
+
+		if (!hasTrailingSpace && afterGlobal === "") {
+			return filter("", TOP_LEVEL_SUBCOMMANDS, trimmed);
+		}
+
+		// Recurse on the clean remainder and prepend "--global "
+		const subCompletions = completeEvalArgumentsClean(afterGlobal, config);
+		if (!subCompletions) return null;
+
+		return subCompletions.map((item) => ({
+			value: `--global ${item.value}`,
+			label: item.label,
+			description: item.description,
+		}));
+	}
+
+	return completeEvalArgumentsClean(trimmed, config);
+}
+
+function completeEvalArgumentsClean(
+	trimmed: string,
+	config: EvalHarnessConfig,
+): Array<{ value: string; label: string; description: string }> | null {
 	if (!trimmed.includes(" ")) {
-		return filter("", SUBCOMMANDS, trimmed);
+		return filter("", TOP_LEVEL_SUBCOMMANDS, trimmed);
 	}
 
 	const [sub] = trimmed.split(/\s+/);
@@ -117,6 +160,7 @@ export function completeEvalArguments(
 
 	const afterSub = trimmed.slice(sub.length).trimStart();
 
+	// /eval rating [on|off]
 	if (sub === "rating") {
 		const current = config.humanRating;
 		const items = TOGGLE_VALUES.map((t) => {
@@ -132,6 +176,13 @@ export function completeEvalArguments(
 		return filtered.length > 0 ? filtered : items;
 	}
 
+	// Direct setting access: /eval <setting> [value]
+	const spec = findSetting(sub);
+	if (spec) {
+		return completeValues(`${spec.key} `, spec, config, afterSub);
+	}
+
+	// Legacy: /eval config [get|set]
 	if (sub === "config") {
 		if (!afterSub.includes(" ")) {
 			return filter("config ", CONFIG_ACTIONS, afterSub);
@@ -147,19 +198,17 @@ export function completeEvalArguments(
 		}
 
 		if (action === "set") {
-			// Handle --global flag before key
 			if (!afterAction.includes(" ")) {
-				// Could be --global or a key
 				const items = [
 					...GLOBAL_FLAG.map((s) => ({
 						value: `config set ${s.value} `,
 						label: s.value,
 						description: s.description,
 					})),
-					...SETTING_SPECS.filter((spec) => spec.key.startsWith(afterAction)).map((spec) => ({
-						value: `config set ${spec.key} `,
-						label: spec.key,
-						description: `${spec.description} (nyní: ${formatValue(config[spec.key])})`,
+					...SETTING_SPECS.filter((specItem) => specItem.key.startsWith(afterAction)).map((specItem) => ({
+						value: `config set ${specItem.key} `,
+						label: specItem.key,
+						description: `${specItem.description} (nyní: ${formatValue(config[specItem.key])})`,
 					})),
 				];
 				return items.length > 0 ? items : null;
@@ -167,7 +216,6 @@ export function completeEvalArguments(
 			const [first] = afterAction.split(/\s+/);
 			if (!first) return null;
 
-			// If first is --global, show keys next
 			if (first === "--global") {
 				const afterGlobal = afterAction.slice(first.length).trimStart();
 				if (!afterGlobal.includes(" ")) {
@@ -175,18 +223,16 @@ export function completeEvalArguments(
 				}
 				const [key] = afterGlobal.split(/\s+/);
 				if (!key) return null;
-				const spec = findSetting(key);
-				if (!spec) return null;
+				const targetSpec = findSetting(key);
+				if (!targetSpec) return null;
 				const afterKey = afterGlobal.slice(key.length).trimStart();
-				return completeValues(`config set --global ${key} `, spec, config, afterKey);
+				return completeValues(`config set --global ${key} `, targetSpec, config, afterKey);
 			}
 
-			// Otherwise first is a key
-			const key = first;
-			const spec = findSetting(key);
-			if (!spec) return null;
-			const afterKey = afterAction.slice(key.length).trimStart();
-			return completeValues(`config set ${key} `, spec, config, afterKey);
+			const targetSpec = findSetting(first);
+			if (!targetSpec) return null;
+			const afterKey = afterAction.slice(first.length).trimStart();
+			return completeValues(`config set ${first} `, targetSpec, config, afterKey);
 		}
 	}
 

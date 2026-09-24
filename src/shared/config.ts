@@ -1,10 +1,12 @@
 /**
- * Global config for pi-eval-harness: ~/.pi/agent/pi-eval-harness.json
+ * Config for pi-eval-harness:
+ * - Global: ~/.pi/agent/pi-eval-harness.json
+ * - Project: <cwd>/.pi/pi-eval-harness.json
  */
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 export interface EvalHarnessConfig {
 	/** Ask the user for a quick human rating when the agent settles (TUI only). */
@@ -24,25 +26,61 @@ export const DEFAULT_CONFIG: EvalHarnessConfig = {
 	ratingOnlyWhenBlocked: false,
 };
 
-const CONFIG_DIR = join(homedir(), ".pi", "agent");
-const CONFIG_FILE = join(CONFIG_DIR, "pi-eval-harness.json");
+export const GLOBAL_CONFIG_FILE = join(homedir(), ".pi", "agent", "pi-eval-harness.json");
 
-export function loadConfig(): EvalHarnessConfig {
+export function projectConfigPath(cwd: string): string {
+	return join(cwd, ".pi", "pi-eval-harness.json");
+}
+
+export function loadConfig(cwd?: string): EvalHarnessConfig {
+	let merged: EvalHarnessConfig = { ...DEFAULT_CONFIG };
+
+	// 1. Global config (~/.pi/agent/pi-eval-harness.json)
 	try {
-		if (existsSync(CONFIG_FILE)) {
-			return { ...DEFAULT_CONFIG, ...JSON.parse(readFileSync(CONFIG_FILE, "utf8")) };
+		if (existsSync(GLOBAL_CONFIG_FILE)) {
+			merged = { ...merged, ...JSON.parse(readFileSync(GLOBAL_CONFIG_FILE, "utf8")) };
 		}
 	} catch {
 		// fall through
 	}
-	return { ...DEFAULT_CONFIG };
+
+	// 2. Project config (<cwd>/.pi/pi-eval-harness.json)
+	if (cwd) {
+		try {
+			const projFile = projectConfigPath(cwd);
+			if (existsSync(projFile)) {
+				merged = { ...merged, ...JSON.parse(readFileSync(projFile, "utf8")) };
+			}
+		} catch {
+			// fall through
+		}
+	}
+
+	return merged;
 }
 
-export function saveConfig(cfg: EvalHarnessConfig): void {
-	try {
-		if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
-		writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), "utf8");
-	} catch {
-		// best-effort
+export function saveConfig(cfg: EvalHarnessConfig, isGlobal = false, cwd?: string): void {
+	if (isGlobal) {
+		try {
+			mkdirSync(dirname(GLOBAL_CONFIG_FILE), { recursive: true });
+			writeFileSync(GLOBAL_CONFIG_FILE, JSON.stringify(cfg, null, 2), "utf8");
+		} catch {
+			// best-effort
+		}
+	} else if (cwd) {
+		try {
+			const projFile = projectConfigPath(cwd);
+			mkdirSync(dirname(projFile), { recursive: true });
+			writeFileSync(projFile, JSON.stringify(cfg, null, 2), "utf8");
+		} catch {
+			// best-effort
+		}
+	} else {
+		try {
+			mkdirSync(dirname(GLOBAL_CONFIG_FILE), { recursive: true });
+			writeFileSync(GLOBAL_CONFIG_FILE, JSON.stringify(cfg, null, 2), "utf8");
+		} catch {
+			// best-effort
+		}
 	}
 }

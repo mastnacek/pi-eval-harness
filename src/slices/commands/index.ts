@@ -45,10 +45,16 @@ export function registerEvalGateTool(pi: ExtensionAPI, state: EvalHarnessState):
 
 export function registerEvalCommand(pi: ExtensionAPI, state: EvalHarnessState): void {
 	pi.registerCommand("eval", {
-		description: "Evaluation harness (/eval [run|card|rubric|config <get|set>|rating <on|off>])",
+		description: "Evaluation harness (/eval [run|card|rubric|status|rating <on|off>|<setting> <val>])",
 		getArgumentCompletions: (prefix) => completeEvalArguments(prefix, state.config),
 		handler: async (args, ctx) => {
-			const sub = args.trim() || "run";
+			const tokens = args.trim().split(/\s+/).filter(Boolean);
+			const isGlobal = tokens.some((t) => t.toLowerCase() === "--global");
+			const cleanTokens = tokens.filter((t) => t.toLowerCase() !== "--global");
+
+			const sub = (cleanTokens[0] ?? "").toLowerCase() || "run";
+			const rest = cleanTokens.slice(1);
+			const rawValue = rest.join(" ").trim();
 			const rubric = loadRubric(ctx.cwd ?? process.cwd());
 
 			if (sub === "rubric") {
@@ -61,22 +67,90 @@ export function registerEvalCommand(pi: ExtensionAPI, state: EvalHarnessState): 
 				return;
 			}
 
-			if (sub.startsWith("config")) {
-				await handleConfig(state, sub, ctx);
+			if (sub === "status") {
+				const lines = [
+					"⚙️ [pi-eval-harness — Stav konfigurace]:",
+					`- humanRating: ${state.config.humanRating ? "true (ZAPNUTO)" : "false (VYPNUTO)"}`,
+					`- autoGate: ${state.config.autoGate ? "true (ZAPNUTO)" : "false (VYPNUTO)"}`,
+					`- ratingOnlyWhenBlocked: ${state.config.ratingOnlyWhenBlocked ? "true (ZAPNUTO)" : "false (VYPNUTO)"}`,
+					`- ratingTimeoutMs: ${state.config.ratingTimeoutMs} ms`,
+					"",
+					"Tip: Použijte `/eval <nastavení> <hodnota>` pro změnu v projektu, nebo přidejte `--global` pro trvalé uložení.",
+				];
+				if (ctx.hasUI) ctx.ui.notify(lines.join("\n"), "info");
 				return;
 			}
 
-			if (sub.startsWith("rating")) {
-				const mode = sub.slice(6).trim();
-				if (mode === "on" || mode === "off") {
-					state.config.humanRating = mode === "on";
-					saveConfig(state.config);
+			if (sub === "help" || sub === "-h" || sub === "--help") {
+				const help = [
+					"# /eval — Evaluation harness",
+					"",
+					"Příkazy:",
+					"  /eval run                         — Spustit deterministický eval gate",
+					"  /eval card                        — Posledních 10 záznamů hodnocení",
+					"  /eval rubric                      — Zobrazit aktivní rubriku projektu",
+					"  /eval status                      — Zobrazit konfiguraci a hodnoty",
+					"  /eval rating [on|off]             — Přepnout rychlé hodnocení uživatelem",
+					"  /eval <nastavení> [hodnota]       — Přímé zobrazení nebo nastavení volby",
+					"  /eval --global <nastavení> <hodn> — Uložit nastavení globálně (~/.pi/agent/)",
+					"",
+					"Nastavení: autoGate, ratingOnlyWhenBlocked, humanRating, ratingTimeoutMs",
+				].join("\n");
+				if (ctx.hasUI) ctx.ui.notify(help, "info");
+				return;
+			}
+
+			// Shortcut: /eval rating [on|off]
+			if (sub === "rating") {
+				if (rawValue === "on" || rawValue === "true") {
+					state.config.humanRating = true;
+					saveConfig(state.config, isGlobal, ctx.cwd);
+					if (ctx.hasUI) ctx.ui.notify(`Human rating: ON (${isGlobal ? "globálně" : "projekt"})`, "info");
+					return;
 				}
-				if (ctx.hasUI) ctx.ui.notify(`Human rating: ${state.config.humanRating ? "ON" : "OFF"}`, "info");
+				if (rawValue === "off" || rawValue === "false") {
+					state.config.humanRating = false;
+					saveConfig(state.config, isGlobal, ctx.cwd);
+					if (ctx.hasUI) ctx.ui.notify(`Human rating: OFF (${isGlobal ? "globálně" : "projekt"})`, "info");
+					return;
+				}
+				if (ctx.hasUI) {
+					ctx.ui.notify(`Human rating: ${state.config.humanRating ? "ON" : "OFF"}. Použij: /eval rating on|off`, "info");
+				}
 				return;
 			}
 
-			// /eval run
+			// Direct setting access: /eval <setting> [value]
+			const directSpec = findSetting(sub);
+			if (directSpec) {
+				if (!rawValue) {
+					if (ctx.hasUI) {
+						ctx.ui.notify(`${directSpec.key} = ${formatValue(state.config[directSpec.key])} (${directSpec.description})`, "info");
+					}
+					return;
+				}
+
+				const parsed = parseValue(directSpec, rawValue);
+				if (!parsed.ok) {
+					if (ctx.hasUI) ctx.ui.notify(parsed.error ?? "Neplatná hodnota.", "error");
+					return;
+				}
+
+				Object.assign(state.config, { [directSpec.key]: parsed.value });
+				saveConfig(state.config, isGlobal, ctx.cwd);
+				if (ctx.hasUI) {
+					ctx.ui.notify(`Uloženo (${isGlobal ? "globálně" : "projekt"}): ${directSpec.key} = ${formatValue(parsed.value)}`, "info");
+				}
+				return;
+			}
+
+			// Legacy compatibility: /eval config get|set
+			if (sub === "config") {
+				await handleConfig(state, cleanTokens.slice(1), isGlobal, ctx);
+				return;
+			}
+
+			// Default: /eval run
 			const verdict = runGate(rubric, {
 				sessionText: state.sessionEvidence,
 				signals: state.signalCounts,
@@ -87,35 +161,29 @@ export function registerEvalCommand(pi: ExtensionAPI, state: EvalHarnessState): 
 	});
 }
 
-/** /eval config get|set — driven by the settings catalogue (single source of truth). */
+/** Legacy /eval config get|set — kept for backward compatibility. */
 async function handleConfig(
 	state: EvalHarnessState,
-	sub: string,
+	parts: string[],
+	isGlobal: boolean,
 	ctx: ExtensionCommandContext,
 ): Promise<void> {
-	const parts = sub.split(/\s+/).filter(Boolean);
-	const action = parts[1]?.toLowerCase();
+	const action = parts[0]?.toLowerCase();
 
-	if (!action || action === "status" || !["get", "set"].includes(action)) {
-		if (ctx.hasUI) ctx.ui.notify("Usage: /eval config get <key> | /eval config set [--global] <key> <value>", "info");
+	if (!action || !["get", "set"].includes(action)) {
+		if (ctx.hasUI) ctx.ui.notify("Použití: /eval <nastavení> <hodnota> (nebo zastaralé /eval config get|set)", "info");
 		return;
 	}
 
-	// Handle --global flag (positional, before key)
-	let keyIndex = 2;
-	if (parts[2] === "--global") {
-		keyIndex = 3;
-	}
-
-	const key = parts[keyIndex];
+	const key = parts[1];
 	if (!key) {
-		if (ctx.hasUI) ctx.ui.notify("Missing setting key. Try /eval config get <key>.", "warning");
+		if (ctx.hasUI) ctx.ui.notify("Chybí klíč nastavení. Zkuste: /eval status", "warning");
 		return;
 	}
 
 	const spec = findSetting(key);
 	if (!spec) {
-		if (ctx.hasUI) ctx.ui.notify(`Unknown setting '${key}'.`, "warning");
+		if (ctx.hasUI) ctx.ui.notify(`Neznámé nastavení '${key}'.`, "warning");
 		return;
 	}
 
@@ -124,22 +192,21 @@ async function handleConfig(
 		return;
 	}
 
-	// For set, value starts after key (and optional --global)
-	const raw = parts.slice(keyIndex + 1).join(" ");
+	const raw = parts.slice(2).join(" ");
 	if (!raw) {
-		if (ctx.hasUI) ctx.ui.notify(`Missing value. /eval config set [--global] ${key} <value>`, "warning");
+		if (ctx.hasUI) ctx.ui.notify(`Chybí hodnota: /eval ${key} <hodnota>`, "warning");
 		return;
 	}
 
 	const parsed = parseValue(spec, raw);
 	if (!parsed.ok) {
-		if (ctx.hasUI) ctx.ui.notify(parsed.error ?? "Invalid value.", "error");
+		if (ctx.hasUI) ctx.ui.notify(parsed.error ?? "Neplatná hodnota.", "error");
 		return;
 	}
 
 	Object.assign(state.config, { [spec.key]: parsed.value });
-	saveConfig(state.config);
-	if (ctx.hasUI) ctx.ui.notify(`Saved: ${key} = ${formatValue(parsed.value)}`, "info");
+	saveConfig(state.config, isGlobal, ctx.cwd);
+	if (ctx.hasUI) ctx.ui.notify(`Uloženo (${isGlobal ? "globálně" : "projekt"}): ${key} = ${formatValue(parsed.value)}`, "info");
 }
 
 function persistVerdict(cwd: string, rubricName: string, verdict: GateVerdict): void {

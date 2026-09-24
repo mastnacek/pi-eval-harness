@@ -15,13 +15,21 @@
  * index.ts wires them. NodeNext: src/** imports use explicit .js extensions.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createEvalHarnessState } from "./src/shared/state.js";
+import { loadConfig } from "./src/shared/config.js";
 import { registerPipeline } from "./src/slices/pipeline/index.js";
 import { registerEvalGateTool, registerEvalCommand } from "./src/slices/commands/index.js";
 
 export default function evalHarnessExtension(pi: ExtensionAPI): void {
 	const state = createEvalHarnessState();
+
+	// Session initialization: reload cascading config (defaults <- global <- project)
+	state.track(
+		pi.on("session_start", async (_event, ctx: ExtensionContext) => {
+			state.config = loadConfig(ctx.cwd);
+		}),
+	);
 
 	registerPipeline(pi, state);
 	registerEvalGateTool(pi, state);

@@ -43,6 +43,11 @@ export const SETTING_SPECS: readonly SettingSpec[] = [
 			false: "Vypnuto — dialog po každém dokončení agenta",
 		},
 	},
+	{
+		key: "ratingTimeoutMs",
+		kind: "number",
+		description: "Rating dialog timeout in milliseconds (TUI only)",
+	},
 ];
 
 export function findSetting(key: string): SettingSpec | undefined {
