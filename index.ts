@@ -22,10 +22,15 @@ import { loadRubric, rubricToPrompt, type Rubric } from "./rubric.ts";
 import { runGate, type GateVerdict } from "./gate.ts";
 import { appendRecord, readRecords, type ScoreRecord } from "./ledger.ts";
 import { summarize } from "./summary.ts";
+import { loadConfig, saveConfig, type EvalHarnessConfig } from "./config.ts";
 
 const SESSION_FLAG = "eval-harness-session-evidence";
 
+/** Human quick-rating choices; pre-filled with the gate score. */
+const RATING_CHOICES = ["Keep (accept)", "Over (penalize)", "Skip (no record)"] as const;
+
 export default function evalHarnessExtension(pi: ExtensionAPI): void {
+	const config: EvalHarnessConfig = loadConfig();
 	const unsubscribers: Array<() => void> = [];
 	const track = (result: unknown): void => {
 		if (typeof result === "function") unsubscribers.push(result as () => void);
@@ -109,7 +114,14 @@ export default function evalHarnessExtension(pi: ExtensionAPI): void {
 				{ label: "run", value: "run" },
 				{ label: "card", value: "card" },
 				{ label: "rubric", value: "rubric" },
+				{ label: "rating", value: "rating " },
 			];
+			if (prefix.startsWith("rating ")) {
+				return [
+					{ label: "on", value: "rating on" },
+					{ label: "off", value: "rating off" },
+				];
+			}
 			return subcmds.filter((s) => s.label.startsWith(prefix));
 		},
 		handler: async (args, ctx) => {
@@ -121,34 +133,87 @@ export default function evalHarnessExtension(pi: ExtensionAPI): void {
 				return;
 			}
 
-			if (sub === "card") {
-				if (ctx.hasUI) ctx.ui.notify(readScoreSummary(), "info");
-				return;
-			}
+		if (sub === "card") {
+			if (ctx.hasUI) ctx.ui.notify(readScoreSummary(), "info");
+			return;
+		}
 
-			// /eval run
+		if (sub.startsWith("rating")) {
+			const mode = sub.slice(6).trim();
+			if (mode === "on" || mode === "off") {
+				config.humanRating = mode === "on";
+				saveConfig(config);
+			}
+			if (ctx.hasUI) {
+				ctx.ui.notify(
+					`Human rating: ${config.humanRating ? "ON" : "OFF"} | Auto-gate: ${config.autoGate ? "ON" : "OFF"} | Only-when-BLOCKED: ${config.ratingOnlyWhenBlocked ? "ON" : "OFF"} | Timeout: ${config.ratingTimeoutMs}ms\nUsage: /eval rating [on|off]`,
+					"info",
+				);
+			}
+			return;
+		}
+
+		// /eval run
 			const verdict = runGate(rubric, { sessionText: sessionEvidence });
 			persistVerdict(ctx.cwd ?? process.cwd(), rubric.name, verdict);
 			if (ctx.hasUI) ctx.ui.notify(formatVerdict(verdict), verdict.verdict === "ACCEPTED" ? "info" : "warning");
 		},
 	});
 
-	// 5. Cleanup
+	// 5. Human quick-rating + optional auto-gate when the agent settles.
+	// Notebook take: Dan's loop is unattended (out-of-loop) and the DoD closes work;
+	// the human rating here is the in-loop signal layer — pre-filled, 1 keystroke,
+	// auto-dismissing — so it motivates without babysitting the agent.
+	track(
+		pi.on("agent_settled", async (_event, ctx) => {
+			if (!ctx.hasUI || ctx.mode !== "tui") return;
+			const rubric = currentRubric(ctx);
+			const verdict = runGate(rubric, { sessionText: sessionEvidence, skipCommands: !config.autoGate });
+			persistVerdict(ctx.cwd ?? process.cwd(), rubric.name, verdict);
+
+			if (!config.humanRating) return;
+			if (config.ratingOnlyWhenBlocked && verdict.verdict !== "BLOCKED") return;
+
+			try {
+				const choice = await ctx.ui.select(
+					`Gate: ${verdict.verdict} ${verdict.score}/${verdict.maxScore} — your rating?`,
+					[...RATING_CHOICES],
+					{ timeout: config.ratingTimeoutMs },
+				);
+				if (!choice || choice === "Skip (no record)") return;
+				const over = choice === "Over (penalize)";
+				appendRecord({
+					at: new Date().toISOString(),
+					project: ctx.cwd ?? process.cwd(),
+					rubric: rubric.name,
+					verdict: over ? "BLOCKED" : verdict.verdict,
+					score: over ? Math.max(0, verdict.score - Math.round(verdict.maxScore * 0.25)) : verdict.score,
+					maxScore: verdict.maxScore,
+					failed: verdict.results.filter((r) => !r.ok).map((r) => r.id),
+					instantFailures: verdict.failures.map((f) => f.id),
+				});
+			} catch {
+				// Dialog unavailable/dismissed — gate verdict already persisted.
+			}
+		}),
+	);
+
+	// 6. Cleanup
 	track(
 		pi.on("session_shutdown", async (_event, ctx) => {
-		while (unsubscribers.length > 0) {
-			try {
-				unsubscribers.pop()?.();
-			} catch {
-				// ignore
+			while (unsubscribers.length > 0) {
+				try {
+					unsubscribers.pop()?.();
+				} catch {
+					// ignore
+				}
 			}
-		}
-		sessionEvidence = "";
-		try {
-			if (ctx.hasUI) ctx.ui.setStatus("eval-harness", undefined);
-		} catch {
-			// session gone
-		}
+			sessionEvidence = "";
+			try {
+				if (ctx.hasUI) ctx.ui.setStatus("eval-harness", undefined);
+			} catch {
+				// session gone
+			}
 		}),
 	);
 }
