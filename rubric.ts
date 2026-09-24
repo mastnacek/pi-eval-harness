@@ -79,6 +79,50 @@ export const DEFAULT_RUBRIC: Rubric = {
 	],
 };
 
+/**
+ * Signals captured from other plugins' hooks (pi-lens diagnostics, line-limit
+ * hook). The extension records hits during the session and the gate deducts
+ * them from the final score.
+ */
+export interface SignalPenalty {
+	id: string;
+	description: string;
+	/** Points deducted per occurrence, capped at the rubric's total. */
+	perHit: number;
+	/** Maximum total deduction for this signal class. */
+	cap: number;
+	count: number;
+}
+
+export function signalPenaltyCatalog(): Array<Omit<SignalPenalty, "count">> {
+	return [
+		{
+			id: "lsp-syntax-error",
+			description: "LSP syntax/type error left in edited files",
+			perHit: 10,
+			cap: 30,
+		},
+		{
+			id: "lsp-warning",
+			description: "LSP warning left in edited files",
+			perHit: 3,
+			cap: 9,
+		},
+		{
+			id: "file-length-violation",
+			description: "Source file over the line limit (soft target exceeded)",
+			perHit: 5,
+			cap: 20,
+		},
+		{
+			id: "scope-wander",
+			description: "Edited files outside the user-provided scope",
+			perHit: 15,
+			cap: 45,
+		},
+	];
+}
+
 const RUBRIC_PATH = join(".pi", "eval-harness", "RUBRIC.md");
 
 /** Extract the first fenced JSON block from a markdown document. */

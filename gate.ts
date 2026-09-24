@@ -8,7 +8,7 @@
 
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import type { Criterion, Rubric } from "./rubric.js";
+import type { Criterion, Rubric, SignalPenalty } from "./rubric.js";
 
 export interface CriterionResult {
 	id: string;
@@ -24,12 +24,23 @@ export interface InstantFailureHit {
 	evidence: string;
 }
 
+/** A per-hit deduction from another plugin's hook signal (LSP, line limit). */
+export interface SignalPenaltyHit {
+	id: string;
+	description: string;
+	/** Total points deducted for this signal class (perHit × hits, capped). */
+	deduction: number;
+	hits: number;
+}
+
 export interface GateVerdict {
 	verdict: "ACCEPTED" | "BLOCKED";
 	score: number;
 	maxScore: number;
 	results: CriterionResult[];
 	failures: InstantFailureHit[];
+	/** Deductions applied for hook signals (LSP errors, length violations). */
+	penalties: SignalPenaltyHit[];
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -78,10 +89,11 @@ function runCriterion(c: Criterion): CriterionResult {
 
 export function runGate(
 	rubric: Rubric,
-	options: { sessionText?: string; skipCommands?: boolean } = {},
+	options: { sessionText?: string; skipCommands?: boolean; signals?: SignalPenalty[] } = {},
 ): GateVerdict {
 	const results: CriterionResult[] = [];
 	const failures: InstantFailureHit[] = [];
+	const penalties: SignalPenaltyHit[] = [];
 
 	for (const c of rubric.criteria) {
 		if (options.skipCommands && c.evidence.kind === "command") {
@@ -115,8 +127,16 @@ export function runGate(
 		}
 	}
 
+	for (const s of options.signals ?? []) {
+		if (s.count <= 0) continue;
+		const deduction = Math.min(s.perHit * s.count, s.cap);
+		penalties.push({ id: s.id, description: s.description, deduction, hits: s.count });
+	}
+
 	const maxScore = rubric.criteria.reduce((sum, c) => sum + c.weight, 0);
-	const earned = failures.length > 0 ? 0 : results.reduce((sum, r) => sum + (r.ok ? r.weight : 0), 0);
+	const raw = failures.length > 0 ? 0 : results.reduce((sum, r) => sum + (r.ok ? r.weight : 0), 0);
+	const penaltyTotal = failures.length > 0 ? 0 : penalties.reduce((sum, p) => sum + p.deduction, 0);
+	const earned = Math.max(0, raw - penaltyTotal);
 
 	return {
 		verdict: failures.length === 0 && earned === maxScore ? "ACCEPTED" : "BLOCKED",
@@ -124,5 +144,6 @@ export function runGate(
 		maxScore,
 		results,
 		failures,
+		penalties,
 	};
 }

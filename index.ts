@@ -18,7 +18,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { loadRubric, rubricToPrompt, type Rubric } from "./rubric.ts";
+import { loadRubric, rubricToPrompt, signalPenaltyCatalog, type Rubric, type SignalPenalty } from "./rubric.ts";
 import { runGate, type GateVerdict } from "./gate.ts";
 import { appendRecord, readRecords, type ScoreRecord } from "./ledger.ts";
 import { summarize } from "./summary.ts";
@@ -38,6 +38,9 @@ export default function evalHarnessExtension(pi: ExtensionAPI): void {
 
 	/** Rolling transcript evidence for instant-failure scanning. */
 	let sessionEvidence = "";
+
+	/** Penalty hits captured from other plugins' hook output during the session. */
+	const signalCounts: SignalPenalty[] = signalPenaltyCatalog().map((s) => ({ ...s, count: 0 }));
 
 	function persistVerdict(cwd: string, rubricName: string, verdict: GateVerdict): void {
 		appendRecord({
@@ -68,6 +71,13 @@ export default function evalHarnessExtension(pi: ExtensionAPI): void {
 			for (const f of rubric.instantFailures) descriptions[f.id] = f.description;
 			event.systemPromptOptions.promptGuidelines.push(summarize(descriptions));
 			event.systemPromptOptions.promptGuidelines.push(rubricToPrompt(rubric));
+			// Scope convention (Dan: instant failure if deliverables leave the working dir):
+			// stay on the files/folders the user named; no curiosity wanderings.
+			event.systemPromptOptions.promptGuidelines.push(
+				"SCOPE CONVENTION: work only on the files and folders the user named or that the task directly requires. " +
+					"Do not explore, refactor or fix anything else out of curiosity. " +
+					"Temp files are fine. If you cause an error, stop and report it immediately.",
+			);
 		}),
 	);
 
@@ -78,8 +88,32 @@ export default function evalHarnessExtension(pi: ExtensionAPI): void {
 			for (const part of event.content) {
 				if (part.type === "text") sessionEvidence += `\n${part.text}`;
 			}
+			captureHookSignals(event.content);
 		}),
 	);
+
+	/**
+	 * Record penalty signals from other plugins' hook output (LSP diagnostics,
+	 * line-limit warnings) seen in tool results. Counts feed the gate at settle.
+	 */
+	function captureHookSignals(content: ReadonlyArray<{ type: string; text?: string }>): void {
+		for (const part of content) {
+			if (part.type !== "text" || !part.text) continue;
+			if (/\[Line limit exceeded\]|Line limit exceeded/.test(part.text)) {
+				recordSignal("file-length-violation");
+			}
+			if (/error\[ts\]|error TS\d+|\[ Semgrep\] \(error|severity.*"error"/i.test(part.text)) {
+				recordSignal("lsp-syntax-error");
+			} else if (/warning\[ast-grep\]|warning\[ts\]|\[ Semgrep\] \(warning/i.test(part.text)) {
+				recordSignal("lsp-warning");
+			}
+		}
+	}
+
+	function recordSignal(id: string): void {
+		const entry = signalCounts.find((s) => s.id === id);
+		if (entry) entry.count += 1;
+	}
 
 	// 3. Tool: eval_gate — run the deterministic gate on demand.
 	pi.registerTool({
@@ -100,6 +134,7 @@ export default function evalHarnessExtension(pi: ExtensionAPI): void {
 			const verdict = runGate(rubric, {
 				sessionText: sessionEvidence,
 				skipCommands: params.dry_run === true,
+				signals: signalCounts,
 			});
 			persistVerdict(ctx.cwd ?? process.cwd(), rubric.name, verdict);
 			return { content: [{ type: "text", text: formatVerdict(verdict) }], details: { verdict: verdict.verdict, score: verdict.score } };
@@ -154,7 +189,7 @@ export default function evalHarnessExtension(pi: ExtensionAPI): void {
 		}
 
 		// /eval run
-			const verdict = runGate(rubric, { sessionText: sessionEvidence });
+			const verdict = runGate(rubric, { sessionText: sessionEvidence, signals: signalCounts });
 			persistVerdict(ctx.cwd ?? process.cwd(), rubric.name, verdict);
 			if (ctx.hasUI) ctx.ui.notify(formatVerdict(verdict), verdict.verdict === "ACCEPTED" ? "info" : "warning");
 		},
@@ -168,7 +203,11 @@ export default function evalHarnessExtension(pi: ExtensionAPI): void {
 		pi.on("agent_settled", async (_event, ctx) => {
 			if (!ctx.hasUI || ctx.mode !== "tui") return;
 			const rubric = currentRubric(ctx);
-			const verdict = runGate(rubric, { sessionText: sessionEvidence, skipCommands: !config.autoGate });
+			const verdict = runGate(rubric, {
+				sessionText: sessionEvidence,
+				skipCommands: !config.autoGate,
+				signals: signalCounts,
+			});
 			persistVerdict(ctx.cwd ?? process.cwd(), rubric.name, verdict);
 
 			if (!config.humanRating) return;
@@ -209,6 +248,7 @@ export default function evalHarnessExtension(pi: ExtensionAPI): void {
 				}
 			}
 			sessionEvidence = "";
+			for (const s of signalCounts) s.count = 0;
 			try {
 				if (ctx.hasUI) ctx.ui.setStatus("eval-harness", undefined);
 			} catch {
@@ -222,6 +262,9 @@ function formatVerdict(v: GateVerdict): string {
 	const lines: string[] = [];
 	for (const r of v.results) {
 		lines.push(`[${r.ok ? "PASS" : "FAIL"}] ${r.id} (${r.weight} pts) — ${r.reason.split("\n")[0]}`);
+	}
+	for (const p of v.penalties) {
+		lines.push(`[PENALTY] ${p.id} ×${p.hits} (-${p.deduction} pts) — ${p.description}`);
 	}
 	for (const f of v.failures) {
 		lines.push(`[INSTANT-FAIL] ${f.id}: ${f.description} — evidence: "${f.evidence}"`);
