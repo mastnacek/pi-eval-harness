@@ -19,12 +19,13 @@
     "README.md",
     "package.json",
     "index.ts",
-    "rubric.ts",
-    "gate.ts",
-    "report-card.ts"
+    "src",
+    "tsconfig.json"
   ],
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",
