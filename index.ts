@@ -16,15 +16,13 @@
  * JSON block inside markdown) or the built-in default.
  */
 
-import { mkdirSync, appendFileSync, existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { loadRubric, rubricToPrompt, type Rubric } from "./rubric.ts";
 import { runGate, type GateVerdict } from "./gate.ts";
+import { appendRecord, readRecords, type ScoreRecord } from "./ledger.ts";
+import { summarize } from "./summary.ts";
 
-const SCORES_FILE = join(homedir(), ".pi", "agent", "eval-harness", "scores.json");
 const SESSION_FLAG = "eval-harness-session-evidence";
 
 export default function evalHarnessExtension(pi: ExtensionAPI): void {
@@ -37,38 +35,34 @@ export default function evalHarnessExtension(pi: ExtensionAPI): void {
 	let sessionEvidence = "";
 
 	function persistVerdict(cwd: string, rubricName: string, verdict: GateVerdict): void {
-		try {
-			mkdirSync(join(SCORES_FILE, ".."), { recursive: true });
-			const record = {
-				at: new Date().toISOString(),
-				project: cwd,
-				rubric: rubricName,
-				verdict: verdict.verdict,
-				score: verdict.score,
-				maxScore: verdict.maxScore,
-				failed: verdict.results.filter((r) => !r.ok).map((r) => r.id),
-				instantFailures: verdict.failures.map((f) => f.id),
-			};
-			appendFileSync(SCORES_FILE, `${JSON.stringify(record)}\n`, "utf8");
-		} catch {
-			// Score persistence is best-effort; grading verdict still returned.
-		}
+		appendRecord({
+			at: new Date().toISOString(),
+			project: cwd,
+			rubric: rubricName,
+			verdict: verdict.verdict,
+			score: verdict.score,
+			maxScore: verdict.maxScore,
+			failed: verdict.results.filter((r) => !r.ok).map((r) => r.id),
+			instantFailures: verdict.failures.map((f) => f.id),
+		});
 	}
 
 	function currentRubric(ctx: ExtensionContext): Rubric {
 		return loadRubric(ctx.cwd ?? process.cwd());
 	}
 
-	// 1. Rubric injection: "How You're Graded" in the system prompt.
+	// 1. Rubric injection: compact "How You're Graded" + monitor summary.
+	// Notebook (Indie Dev Dan): grading section stays short bullet points;
+	// context economy: the model sees ~6 lines, never the ledger or rubric JSON.
 	track(
 		pi.on("before_agent_start", (event, ctx) => {
 			if (!event.systemPromptOptions?.promptGuidelines) return;
 			const rubric = currentRubric(ctx);
+			const descriptions: Record<string, string> = {};
+			for (const c of rubric.criteria) descriptions[c.id] = c.description;
+			for (const f of rubric.instantFailures) descriptions[f.id] = f.description;
+			event.systemPromptOptions.promptGuidelines.push(summarize(descriptions));
 			event.systemPromptOptions.promptGuidelines.push(rubricToPrompt(rubric));
-			event.systemPromptOptions.promptGuidelines.push(
-				"GRADING CONTRACT: your self-assessment is not accepted. Run /eval-gate (or ask the user to) before declaring any task done; " +
-					"only an ACCEPTED verdict closes work. Instant-failure rules void the whole run.",
-			);
 		}),
 	);
 
@@ -140,7 +134,8 @@ export default function evalHarnessExtension(pi: ExtensionAPI): void {
 	});
 
 	// 5. Cleanup
-	pi.on("session_shutdown", async (_event, ctx) => {
+	track(
+		pi.on("session_shutdown", async (_event, ctx) => {
 		while (unsubscribers.length > 0) {
 			try {
 				unsubscribers.pop()?.();
@@ -154,7 +149,8 @@ export default function evalHarnessExtension(pi: ExtensionAPI): void {
 		} catch {
 			// session gone
 		}
-	});
+		}),
+	);
 }
 
 function formatVerdict(v: GateVerdict): string {
@@ -170,18 +166,15 @@ function formatVerdict(v: GateVerdict): string {
 }
 
 function readScoreSummary(): string {
-	if (!existsSync(SCORES_FILE)) return "No evaluations recorded yet. Run /eval run first.";
-	try {
-		const lines = require("node:fs").readFileSync(SCORES_FILE, "utf8").trim().split("\n");
-		const last = lines.slice(-10).map((l: string) => JSON.parse(l) as { at: string; project: string; score: number; maxScore: number; verdict: string });
-		return last
-			.map((r: { at: string; project: string; score: number; maxScore: number; verdict: string }) =>
+	const records = readRecords();
+	if (records.length === 0) return "No evaluations recorded yet. Run /eval run first.";
+	return records
+		.slice(-10)
+		.map(
+			(r: ScoreRecord) =>
 				`${r.at.slice(0, 16)}  ${r.verdict.padEnd(8)}  ${r.score}/${r.maxScore}  ${r.project.split(/[\\/]/).pop()}`,
-			)
-			.join("\n");
-	} catch {
-		return "Score file unreadable.";
-	}
+		)
+		.join("\n");
 }
 
 export { SESSION_FLAG };
